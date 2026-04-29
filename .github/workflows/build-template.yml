@@ -1,0 +1,46 @@
+name: Build Proxmox Template
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'  # Monthly, 3am on the 1st
+  workflow_dispatch:       # Manual trigger
+  push:
+    branches: [main]
+    paths:
+      - 'packer/**'
+      - 'ansible/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # or self-hosted
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: "latest"
+
+      - name: Packer Init
+        working-directory: packer
+        run: packer init .
+
+      - name: Packer Validate
+        working-directory: packer
+        run: packer validate .
+        env:
+          PKR_VAR_proxmox_url: ${{ secrets.PROXMOX_URL }}
+          PKR_VAR_proxmox_token_id: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PKR_VAR_proxmox_token_secret: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PKR_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+
+      - name: Packer Build
+        working-directory: packer
+        run: packer build -on-error=cleanup .
+        env:
+          PKR_VAR_proxmox_url: ${{ secrets.PROXMOX_URL }}
+          PKR_VAR_proxmox_token_id: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PKR_VAR_proxmox_token_secret: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PKR_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
