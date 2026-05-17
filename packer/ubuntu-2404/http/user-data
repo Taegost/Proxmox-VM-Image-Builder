@@ -1,35 +1,104 @@
 #cloud-config
+# =============================================================================
+# Ubuntu 24.04 autoinstall configuration
+#
+# This file is a Packer templatefile() template — the ${variable} placeholders
+# are substituted by Packer before this file is packaged into the CIDATA ISO.
+# It is NOT a static file served over HTTP (see architecture.md for why).
+#
+# Ubuntu's subiquity installer reads this during the OS installation phase.
+# After installation completes, cloud-init picks up from here on first boot.
+#
+# Reference: https://canonical-subiquity.readthedocs-hosted.com/en/latest/reference/autoinstall-reference.html
+# =============================================================================
 autoinstall:
   version: 1
   locale: en_US.UTF-8
   keyboard:
     layout: us
+
+  # DHCP on the primary network interface.
+  # ens18 is the default name for a virtio NIC on Proxmox (PCI slot 0).
+  # If the installer cannot reach the network, open the VM console in Proxmox
+  # and run 'ip link show' to verify the interface name. If it differs, update here.
+  network:
+    network:
+      version: 2
+      ethernets:
+        ens18:
+          dhcp4: true
+
   storage:
     layout:
       name: lvm
+      # LVM layout is used rather than a direct partition so that cloned VMs
+      # can independently extend their root volume after the fact with lvextend.
+      # If you need a specific partition layout (e.g., separate /var), replace
+      # this with an explicit 'storage.config' block.
+
   identity:
     hostname: ubuntu-template
     username: ansible
-    # This is a placeholder password - SSH key auth is the real mechanism
-    # Password: changeme (bcrypt hash)
-    password: "$6$rounds=4096$..."
+    # This hash is used by cloud-init to set the ansible user's Linux password.
+    # The password is usable for local console login and sudo escalation,
+    # but NOT for SSH — password auth over SSH is disabled below.
+    # Value comes from the ANSIBLE_PASSWORD_HASH GitHub secret via Packer templatefile().
+    # To regenerate: openssl passwd -6 -salt $(openssl rand -hex 8) 'YourPassword'
+    password: "${ansible_password_hash}"
+
   ssh:
     install-server: true
     authorized-keys:
-      - "{{ .SSHPublicKey }}"
+      # The ansible user's public key, injected by Packer at build time.
+      # This key is permanent in the template — every cloned VM will have it.
+      # The matching private key is what Ansible uses to connect post-clone.
+      - "${ssh_public_key}"
+    # Disable SSH password authentication at the OS installer level.
+    # Ansible enforces this again in sshd_config as a belt-and-suspenders measure.
+    # If you ever need emergency console access, use the Proxmox noVNC console.
     allow-pw: false
+
   packages:
-    - qemu-guest-agent
-    - curl
-    - wget
-    - git
-    - vim
-    - htop
-    - unzip
     - ca-certificates
-    - python3
+    - cifs-utils          # CIFS/SMB client tools — required for mount.cifs to mount Windows shares or NAS volumes
+    - curl
+    - dnsutils            # dig and nslookup for DNS troubleshooting
+    - fail2ban            # Installed here so the service exists at first boot; configured by Ansible in provision.yml
+    - git
+    - haveged             # Entropy daemon; supplements kernel entropy pool — assumed harmless alongside QEMU's virtio-rng
+    - htop
+    - jq
+    - logrotate
+    - nano
+    - ncdu
+    - net-tools           # ifconfig, netstat — legacy but still useful for quick diagnostics
+    - nfs-common          # NFS client tools — required to mount NFS shares
+    - python3             # Required for Ansible modules to run — must be present before the Ansible provisioner connects
+    - python3-passlib     # Required by Ansible's password_hash filter — must be present before the provisioner runs
     - python3-pip
-    - fail2ban
-    - ntp
+    - qemu-guest-agent    # Required for Proxmox to report VM status, get the IP, and send graceful shutdown signals
+    - rsync
+    - screen
+    - traceroute
+    - unzip
+    - vim
+    - wget
+
+  # Note: 'ntp' is intentionally absent. Ubuntu 24.04 uses systemd-timesyncd
+  # by default, which handles NTP without a separate daemon. Ansible configures
+  # the NTP server addresses in timesyncd.conf.
+
   late-commands:
-    - systemctl enable qemu-guest-agent
+    # Enable qemu-guest-agent so Proxmox can communicate with the VM.
+    # Without this, Proxmox cannot see the VM's IP address, cannot issue graceful
+    # shutdowns (it has to hard-stop the VM like a power cut), and 'qm status'
+    # will not show the VM as running even when it is.
+    # --root=/target applies the command inside the installed OS, not the live environment.
+    - systemctl enable qemu-guest-agent --root=/target
+
+    # Grant the ansible user passwordless sudo.
+    # This is required for both the Packer build (Ansible provisioner) and
+    # for every post-clone Ansible run. Without NOPASSWD, Ansible tasks that
+    # use 'become: true' will hang waiting for a password prompt.
+    - echo "ansible ALL=(ALL) NOPASSWD:ALL" > /target/etc/sudoers.d/ansible
+    - chmod 440 /target/etc/sudoers.d/ansible
