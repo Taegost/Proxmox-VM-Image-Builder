@@ -1,19 +1,59 @@
-name: Build Proxmox Template
+name: Build Proxmox VM Template
 
+# =============================================================================
+# When this workflow runs
+# =============================================================================
 on:
-  schedule:
-    - cron: '0 3 1 * *'  # Monthly, 3am on the 1st
-  workflow_dispatch:       # Manual trigger
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packer/**'
+      - 'ansible/**'
+    # PRs get the 'validate' job only — syntax check, no infrastructure touched.
+
   push:
     branches: [main]
     paths:
       - 'packer/**'
       - 'ansible/**'
+    # Merges to main get both validate and build.
+
+  schedule:
+    # Weekly on Sunday at 03:00 UTC.
+    # Ubuntu publishes security updates on a rolling basis throughout the week.
+    # Weekly rebuilds keep templates within ~7 days of fully patched.
+    # 03:00 UTC = off-peak for most EU/US timezones, low Proxmox host load.
+    - cron: '0 3 * * 0'
+
+  workflow_dispatch:
+    # Manual trigger — useful for testing changes or forcing an out-of-cycle rebuild.
+    inputs:
+      image:
+        description: 'Image to build'
+        required: true
+        default: 'ubuntu-2404'
+        type: choice
+        options:
+          - ubuntu-2404
 
 jobs:
-  build:
-    runs-on: ubuntu-latest  # or self-hosted
-    
+  # ===========================================================================
+  # Job: validate
+  # Runs on: all triggers (PR, push to main, schedule, manual)
+  # ===========================================================================
+  # Checks that Packer HCL is syntactically valid and all required variables
+  # are declared. Does NOT connect to Proxmox or create any infrastructure.
+  # Safe to run on PRs — no secrets are used for actual API calls here;
+  # they are only present so Packer can verify all variables have values.
+  validate:
+    name: Validate — ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Add new images here when they are introduced.
+        # Each matrix entry runs validate independently.
+        image: [ubuntu-2404]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,23 +64,102 @@ jobs:
           version: "latest"
 
       - name: Packer Init
-        working-directory: packer
+        # Downloads required Packer plugins. Runs from the image-specific directory
+        # so Packer finds the .pkr.hcl files and their plugin requirements.
+        working-directory: packer/${{ matrix.image }}
         run: packer init .
 
       - name: Packer Validate
-        working-directory: packer
+        working-directory: packer/${{ matrix.image }}
         run: packer validate .
         env:
-          PKR_VAR_proxmox_url: ${{ secrets.PROXMOX_URL }}
-          PKR_VAR_proxmox_token_id: ${{ secrets.PROXMOX_TOKEN_ID }}
-          PKR_VAR_proxmox_token_secret: ${{ secrets.PROXMOX_TOKEN_SECRET }}
-          PKR_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+          # All required variables must be present for validate to pass —
+          # Packer checks that every declared variable without a default has a value.
+          # It does NOT make API calls or verify that the values are correct.
+          PKR_VAR_proxmox_url:                 ${{ secrets.PROXMOX_URL }}
+          PKR_VAR_proxmox_token_id:            ${{ secrets.PROXMOX_TOKEN_ID }}
+          PKR_VAR_proxmox_token_secret:        ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PKR_VAR_ssh_public_key:              ${{ secrets.SSH_PUBLIC_KEY }}
+          PKR_VAR_ansible_password_hash:       ${{ secrets.ANSIBLE_PASSWORD_HASH }}
+          PKR_VAR_iac_service_ssh_public_key:  ${{ secrets.IAC_SERVICE_SSH_PUBLIC_KEY }}
+          # ssh_private_key_file is not passed here — validate does not attempt SSH.
+          # The default value in variables.pkr.hcl is used, which is intentional.
+
+  # ===========================================================================
+  # Job: build
+  # Runs on: push to main, schedule, manual dispatch (NOT on PRs)
+  # ===========================================================================
+  # Connects to Proxmox via Tailscale and runs a full Packer build.
+  # Produces a new template on the Proxmox cluster. The existing template with
+  # the same VM ID is replaced — Proxmox handles the swap atomically.
+  build:
+    name: Build and Deploy — ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: validate
+    # PRs only get the validate job. Build runs only when code lands on main
+    # or is triggered by schedule or manual dispatch.
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        image: [ubuntu-2404]
+      # Don't cancel other images if one fails — each image is independent
+      # and a failure in one should not block a successful build of another.
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Connect the runner to Tailscale so it can reach the Proxmox API.
+      # This uses an ephemeral auth key — the runner node is automatically
+      # removed from your tailnet after the job ends. No cleanup needed.
+      #
+      # What Tailscale provides here:
+      #   - Runner → Proxmox API (HTTPS on port 8006) over the Tailscale mesh
+      #   - Runner → Proxmox host for SSH (if needed for debugging)
+      #
+      # What Tailscale does NOT need to provide:
+      #   - Proxmox VM → Runner: not required because cloud-init user-data is
+      #     delivered via a CIDATA ISO (not an HTTP server on the runner).
+      #     See docs/architecture.md for why this approach was chosen.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          # The ephemeral flag is set by default in this action. The node will
+          # not persist in your tailnet after the job finishes.
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: "latest"
+
+      - name: Packer Init
+        working-directory: packer/${{ matrix.image }}
+        run: packer init .
+
+      # Write the SSH private key to a temp file so Packer can use it to connect
+      # to the VM during the build. The temp file is scoped to this runner and
+      # does not persist after the job completes.
+      #
+      # Why a file and not an env var? The Packer ssh_private_key_file config
+      # requires a filesystem path — it cannot accept inline key content.
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/packer_ansible_key
+          chmod 600 /tmp/packer_ansible_key
 
       - name: Packer Build
-        working-directory: packer
+        working-directory: packer/${{ matrix.image }}
+        # -on-error=cleanup destroys the partially-built VM if the build fails.
+        # Without this flag, a failed build leaves an orphan VM in Proxmox that
+        # blocks the next run (VM ID conflict) and must be manually destroyed.
         run: packer build -on-error=cleanup .
         env:
-          PKR_VAR_proxmox_url: ${{ secrets.PROXMOX_URL }}
-          PKR_VAR_proxmox_token_id: ${{ secrets.PROXMOX_TOKEN_ID }}
-          PKR_VAR_proxmox_token_secret: ${{ secrets.PROXMOX_TOKEN_SECRET }}
-          PKR_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+          PKR_VAR_proxmox_url:                 ${{ secrets.PROXMOX_URL }}
+          PKR_VAR_proxmox_token_id:            ${{ secrets.PROXMOX_TOKEN_ID }}
+          PKR_VAR_proxmox_token_secret:        ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PKR_VAR_ssh_public_key:              ${{ secrets.SSH_PUBLIC_KEY }}
+          PKR_VAR_ansible_password_hash:       ${{ secrets.ANSIBLE_PASSWORD_HASH }}
+          PKR_VAR_iac_service_ssh_public_key:  ${{ secrets.IAC_SERVICE_SSH_PUBLIC_KEY }}
+          PKR_VAR_ssh_private_key_file:        /tmp/packer_ansible_key

@@ -1,0 +1,12 @@
+---
+# Ansible Galaxy collection requirements
+#
+# Installed automatically by Packer before the playbook runs, via the
+# galaxy_file option in the ansible provisioner block.
+#
+# Version constraint: >=12.0.0,<13.0.0 pins to a known-working minor series.
+# When upgrading, bump the upper bound, re-test the UFW tasks in provision.yml,
+# and update this comment and the plan's Dependencies/Assumptions section.
+collections:
+  - name: community.general
+    version: ">=12.0.0,<13.0.0"
