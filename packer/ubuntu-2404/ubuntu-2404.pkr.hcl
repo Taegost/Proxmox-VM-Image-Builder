@@ -227,7 +227,9 @@ build {
     user          = "ansible"
     extra_arguments = [
       "--extra-vars", "ansible_python_interpreter=/usr/bin/python3",
-      "--extra-vars", "iac_service_ssh_public_key=${var.iac_service_ssh_public_key}",
+      # JSON format is required here: key=value splitting breaks on the space in
+      # the SSH public key string (e.g. 'ssh-ed25519 AAAA... comment').
+      "--extra-vars", "{\"iac_service_ssh_public_key\": \"${var.iac_service_ssh_public_key}\"}",
       # Increase verbosity for debugging Ansible connectivity issues:
       # "-vvv",
     ]
