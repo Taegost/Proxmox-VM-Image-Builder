@@ -1,0 +1,346 @@
+---
+# =============================================================================
+# Baseline provisioning — Ubuntu 24.04 LTS template
+#
+# When this runs:
+#   During the Packer build, AFTER the OS is installed and SSH is available,
+#   BEFORE the final cleanup shell provisioner runs. This is NOT a post-clone
+#   playbook — it runs exactly once per template build.
+#
+# Scope — what belongs here:
+#   Baseline security hardening that every VM needs regardless of its role:
+#   package upgrades, SSH config, fail2ban, sysctl tuning, NTP.
+#
+# Scope — what does NOT belong here:
+#   Application packages, cluster config, NFS mounts, role-specific firewall
+#   rules, or anything that varies by what the VM will actually do. Those go
+#   in post-clone Ansible inventories (see the homelab-k8s repo).
+#
+# Before adding a task: ask "would a k3s node AND a plain utility VM both need
+# this?" If the answer is no, it does not belong here.
+# =============================================================================
+
+- name: Ubuntu 24.04 baseline template provisioning
+  hosts: all
+  become: true
+
+  tasks:
+
+    # =========================================================================
+    # Package hygiene
+    # =========================================================================
+
+    - name: Update apt cache and run dist-upgrade
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        # dist-upgrade (not just 'upgrade') handles kernel and dependency changes.
+        # We intentionally do not set cache_valid_time — the ISO's package index
+        # is weeks old by the time the build runs, so we always refresh.
+
+    - name: Remove packages no longer required
+      ansible.builtin.apt:
+        autoremove: true
+
+    # =========================================================================
+    # SSH hardening
+    # =========================================================================
+    # Belt-and-suspenders: cloud-init autoinstall already sets allow-pw: false
+    # at the OS installer level. We also enforce these settings in sshd_config
+    # so a package update that regenerates sshd_config cannot silently undo them.
+
+    - name: Harden sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+        # validate runs 'sshd -t' against the modified file before saving.
+        # A syntax error here fails the task instead of silently breaking SSH.
+        validate: "sshd -t -f %s"
+        backup: true
+      loop:
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PermitRootLogin',        line: 'PermitRootLogin no' }
+        - { regexp: '^#?PubkeyAuthentication',   line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?X11Forwarding',          line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries',           line: 'MaxAuthTries 3' }
+        # 30 seconds is enough for key exchange on a slow connection.
+        # Longer values give attackers more window; shorter values cause spurious timeouts.
+        - { regexp: '^#?LoginGraceTime',         line: 'LoginGraceTime 30' }
+      notify: Restart SSH
+
+    # =========================================================================
+    # fail2ban
+    # =========================================================================
+    # fail2ban is installed by the autoinstall (user-data packages list).
+    # The default jail.conf bans for 10 minutes on 5 failures — we extend the
+    # ban time to make brute-force attacks impractical rather than just slow.
+    #
+    # We write jail.LOCAL, not jail.conf. jail.conf is owned by the package
+    # and gets overwritten on upgrades. jail.local is the correct override
+    # mechanism and survives package updates.
+
+    - name: Write fail2ban jail.local
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        mode: '0644'
+        content: |
+          [DEFAULT]
+          # Ban for 1 hour after 5 failures within a 10-minute window.
+          # Raising bantime to '1d' or '1w' is reasonable for internet-exposed hosts.
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port    = ssh
+          # 'aggressive' mode catches pre-auth failures (scanners that never complete
+          # the handshake), not just failed authentication attempts.
+          mode    = aggressive
+      notify: Restart fail2ban
+
+    # =========================================================================
+    # Kernel / sysctl hardening
+    # =========================================================================
+    # We write a drop-in to /etc/sysctl.d/ rather than editing /etc/sysctl.conf.
+    # Drop-ins are applied in lexicographic order after sysctl.conf;
+    # '99-hardening.conf' runs last and wins on any conflicts.
+
+    - name: Write sysctl hardening parameters
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-hardening.conf
+        mode: '0644'
+        content: |
+          # --- Network hardening ---
+
+          # Validate source addresses on all interfaces (reverse path filtering).
+          # Drops packets whose source address has no route back through the
+          # interface they arrived on, preventing IP spoofing.
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.conf.all.rp_filter = 1
+
+          # SYN flood protection. The kernel tracks half-open connections using
+          # cryptographic cookies rather than allocating per-connection state.
+          net.ipv4.tcp_syncookies = 1
+
+          # Refuse ICMP redirects. Redirects can silently reroute traffic through
+          # a hostile gateway (MITM). Legitimate homelab routers don't need to send these.
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.secure_redirects = 0
+          net.ipv4.conf.default.secure_redirects = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+
+          # Log packets with impossible source addresses — useful for detecting scans.
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+
+          # Ignore broadcast pings (used in Smurf amplification attacks).
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+          # Suppress bogus ICMP error responses from misconfigured routers.
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+          # --- Kernel hardening ---
+
+          # Restrict /dev/kmsg and dmesg to privileged users.
+          # Kernel messages can reveal memory layout and assist exploit development.
+          kernel.dmesg_restrict = 1
+
+          # Hide kernel symbol addresses from unprivileged users (/proc/kallsyms etc.).
+          # Level 2: hidden even from root unless the process has CAP_SYSLOG.
+          kernel.kptr_restrict = 2
+      notify: Apply sysctl
+
+    # =========================================================================
+    # NTP / time synchronization
+    # =========================================================================
+    # Ubuntu 24.04 uses systemd-timesyncd, not ntpd or chrony.
+    # Accurate time is load-bearing for TLS certificates, log correlation,
+    # and any auth system using time-based tokens (TOTP, Kerberos, JWT expiry).
+    #
+    # We write a drop-in to /etc/systemd/timesyncd.conf.d/ so package updates
+    # to systemd cannot overwrite our NTP server configuration.
+
+    - name: Ensure timesyncd drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/timesyncd.conf.d
+        state: directory
+        mode: '0755'
+      # This directory does not exist by default in a fresh Ubuntu 24.04 install.
+      # It must be created before the next task writes into it.
+
+    - name: Configure NTP servers for timesyncd
+      ansible.builtin.copy:
+        dest: /etc/systemd/timesyncd.conf.d/ntp.conf
+        mode: '0644'
+        content: |
+          [Time]
+          # Cloudflare's NTP service as primary — reliable, anycast, privacy-respecting.
+          # Ubuntu's pool as fallback in case Cloudflare is unreachable from this network.
+          NTP=time.cloudflare.com
+          FallbackNTP=ntp.ubuntu.com
+      notify: Restart timesyncd
+
+    # =========================================================================
+    # iac-service account
+    # =========================================================================
+    # iac-service is the post-clone automation account. Post-clone Ansible
+    # playbooks connect as iac-service for ongoing VM management.
+    # The ansible user's sudoers entry is removed by the shell cleanup provisioner
+    # (it only needs NOPASSWD during the Packer build); iac-service owns elevated
+    # access in every VM cloned from this template.
+    #
+    # SSH key is injected at build time via the iac_service_ssh_public_key Packer variable.
+    # Password is locked — SSH key is the only auth method. For emergency console
+    # access, set a password manually post-clone via 'passwd iac-service'.
+
+    - name: Create iac-service user
+      ansible.builtin.user:
+        name: iac-service
+        comment: "IaC service account for post-clone Ansible automation"
+        password: "!"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Create iac-service .ssh directory
+      ansible.builtin.file:
+        path: /home/iac-service/.ssh
+        state: directory
+        owner: iac-service
+        group: iac-service
+        mode: '0700'
+
+    - name: Add iac-service SSH authorized key
+      ansible.builtin.copy:
+        dest: /home/iac-service/.ssh/authorized_keys
+        content: "{{ iac_service_ssh_public_key }}\n"
+        owner: iac-service
+        group: iac-service
+        mode: '0600'
+
+    - name: Grant iac-service passwordless sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/iac-service
+        content: "iac-service ALL=(ALL) NOPASSWD:ALL\n"
+        mode: '0440'
+        # validate runs visudo against the file before saving.
+        # A syntax error here fails the task rather than silently writing a broken sudoers file.
+        validate: "visudo -cf %s"
+
+    # =========================================================================
+    # Automatic security updates (unattended-upgrades)
+    # =========================================================================
+    # Ubuntu 24.04 server ships unattended-upgrades pre-installed, but we
+    # declare it explicitly (belt-and-suspenders) and write the config files
+    # ourselves so the behaviour is explicit and version-controlled.
+    #
+    # We write replacement config files rather than patching the defaults.
+    # This intentionally drops Ubuntu Pro / ESM channel origins — accepted,
+    # as these are homelab VMs with no Ubuntu Pro enrollment.
+    #
+    # Reboots are a manual operator action: the VM will run a stale kernel
+    # until the operator reboots. unattended-upgrades stages the update but
+    # does not reboot on its own.
+
+    - name: Ensure unattended-upgrades package is present
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+
+    - name: Write 20auto-upgrades config
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: '0644'
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Write 50unattended-upgrades config
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        mode: '0644'
+        content: |
+          Unattended-Upgrade::Allowed-Origins {
+              "${distro_id}:${distro_codename}-security";
+          };
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          // Reboots are a manual operator action — kernel and reboot-requiring
+          // updates are staged but the VM does not reboot on its own.
+          Unattended-Upgrade::Automatic-Reboot "false";
+
+    # =========================================================================
+    # UFW baseline firewall
+    # =========================================================================
+    # Enables UFW with default-deny incoming so every cloned VM starts with a
+    # meaningful firewall posture. SSH is the only allowed inbound port at the
+    # template level. Workload-specific ports (k3s, NFS, etc.) are opened by
+    # post-clone Ansible playbooks in the homelab-k8s repo.
+    #
+    # IMPORTANT — task ordering:
+    # The SSH allow rule MUST be added before UFW is enabled. If UFW is enabled
+    # first with default-deny and no SSH rule, the Packer build SSH connection
+    # is severed mid-run and the build stalls.
+    #
+    # No handler is needed: community.general.ufw applies changes immediately.
+    # Unlike fail2ban (which requires a service restart), UFW has no daemon to
+    # signal — each task takes effect atomically.
+    #
+    # IPv6: Ubuntu 24.04's default /etc/default/ufw has IPV6=yes, so default-deny
+    # incoming applies to both IPv4 and IPv6. Verify IPV6=yes is intact post-build.
+
+    - name: Ensure ufw package is present
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+
+    - name: Set UFW default incoming policy to deny
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: Allow SSH (port 22/tcp)
+      community.general.ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+        comment: SSH
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+
+  # ===========================================================================
+  # Handlers
+  # ===========================================================================
+  # Handlers run only when notified, and only once per play regardless of how
+  # many tasks notified them. They run after all tasks complete, in definition order.
+
+  handlers:
+
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Apply sysctl
+      # sysctl --system re-reads all drop-in files without requiring a reboot.
+      ansible.builtin.command:
+        cmd: sysctl --system
+      changed_when: true
+
+    - name: Restart timesyncd
+      ansible.builtin.service:
+        name: systemd-timesyncd
+        state: restarted
